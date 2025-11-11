@@ -15,7 +15,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 
-# Load .env (Render прокинет переменные окружения, BASE_URL берётся из RENDER_EXTERNAL_URL)
+# Load env
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -23,15 +23,19 @@ API_URL = os.getenv("API_URL", "https://giganoob.com/data/html/users_snapshot.js
 CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))
 CRYPTO_CACHE_TTL = int(os.getenv("CRYPTO_CACHE_TTL", "30"))
 
-# Webhook params
+# Webhook params (Render)
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook").strip()
 BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
+# CoinGecko API key (обязателен для графиков)
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "CG-Demo-API-Key").strip()
+CHART_CACHE_TTL = int(os.getenv("CHART_CACHE_TTL", "120"))  # кэш истории для графиков, сек
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-# Inline keyboards
+# Keyboards
 KB_START = InlineKeyboardMarkup([
     [InlineKeyboardButton("Giga users", callback_data="menu_users")],
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
@@ -71,6 +75,12 @@ HEADERS = {
 CRYPTO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; CryptoPrices/1.0)",
     "Accept": "application/json",
+}
+CG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; CoinGeckoCharts/1.0)",
+    "Accept": "application/json",
+    "x-cg-demo-api-key": COINGECKO_API_KEY,   # для бесплатного: CG-Demo-API-Key, для платного: свой ключ
+    # Если у вас Pro-ключ, вместо строки выше можно добавить: "x-cg-pro-api-key": COINGECKO_API_KEY
 }
 
 # Utils
@@ -165,10 +175,8 @@ async def handle_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_refresh_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    try:
-        await q.answer("Обновляю…", cache_time=0)
-    except Exception:
-        pass
+    try: await q.answer("Обновляю…", cache_time=0)
+    except Exception: pass
     try:
         users, juiced = await get_stats_cached(force=True)
         msg = format_users_message(users, juiced)
@@ -249,10 +257,8 @@ async def handle_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    try:
-        await q.answer("Обновляю…", cache_time=0)
-    except Exception:
-        pass
+    try: await q.answer("Обновляю…", cache_time=0)
+    except Exception: pass
     try:
         data = await get_market_cached(force=True)
         btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
@@ -265,18 +271,31 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh crypto failed")
         await q.message.reply_text("Не удалось обновить цены/курс.")
 
-# ========== Crypto charts (PNG, 7d, 1h/6h/24h deltas) ==========
+# ========== Crypto charts (PNG, 7d) ==========
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+_chart_cache: Dict[str, Tuple[float, List[Tuple[int, float]]]] = {}  # coin_id -> (ts, series)
 
 async def fetch_cg_chart(coin_id: str, days: int = 7, interval: str = "hourly") -> List[Tuple[int, float]]:
+    # cache
+    ts_now = time.monotonic()
+    cached = _chart_cache.get(coin_id)
+    if cached and (ts_now - cached[0]) < CHART_CACHE_TTL:
+        return cached[1]
+
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": str(days), "interval": interval}
-    async with httpx.AsyncClient(timeout=20, headers=CRYPTO_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=20, headers=CG_HEADERS) as client:
         r = await client.get(url, params=params)
+        if r.status_code == 401:
+            # Не задан/не принят ключ — отдадим пусто, обработаем выше
+            raise httpx.HTTPStatusError("401 from CoinGecko - set COINGECKO_API_KEY", request=r.request, response=r)
         r.raise_for_status()
         data = r.json()
+
     prices = data.get("prices") or []
-    return [(int(p[0]), float(p[1])) for p in prices if isinstance(p, list) and len(p) >= 2]
+    series = [(int(p[0]), float(p[1])) for p in prices if isinstance(p, list) and len(p) >= 2]
+    _chart_cache[coin_id] = (ts_now, series)
+    return series
 
 def nearest_price(series: List[Tuple[int, float]], target_ms: int) -> Optional[float]:
     if not series:
@@ -334,10 +353,23 @@ async def render_chart_png(config: Dict, width: int = 800, height: int = 400) ->
 
 async def send_coin_chart(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
                           coin_id: str, symbol: str, color: str) -> None:
-    series = await fetch_cg_chart(coin_id, days=7, interval="hourly")
+    try:
+        series = await fetch_cg_chart(coin_id, days=7, interval="hourly")
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="CoinGecko вернул 401 (нужен API key). "
+                     "В Render → Environment добавьте COINGECKO_API_KEY=CG-Demo-API-Key "
+                     "или свой ключ с coingecko."
+            )
+            return
+        raise
+
     if not series:
         await context.bot.send_message(chat_id=chat_id, text=f"{symbol}: не удалось получить данные.")
         return
+
     cfg = make_chart_config(series, f"{symbol} 7d", color)
     png = await render_chart_png(cfg)
 
@@ -361,10 +393,8 @@ async def handle_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_refresh_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    try:
-        await q.answer("Обновляю графики…", cache_time=0)
-    except Exception:
-        pass
+    try: await q.answer("Обновляю графики…", cache_time=0)
+    except Exception: pass
     await send_charts_pack(update.effective_chat.id, context)
 
 # ========== Start / menu / chatid ==========
@@ -383,10 +413,8 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    try: await q.answer()
+    except Exception: pass
     chat_id = update.effective_chat.id
     if data == "menu_users":
         await send_users(chat_id, context.bot)
@@ -406,10 +434,8 @@ async def on_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    try: await q.answer()
+    except Exception: pass
     try:
         await q.edit_message_text("Выберите действие:", reply_markup=KB_START)
     except Exception:
@@ -418,7 +444,7 @@ async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== run webhook ==========
 def main():
     if not TOKEN:
-        raise SystemExit("Заполните TELEGRAM_TOKEN в .env/Environment")
+        raise SystemExit("Заполните TELEGRAM_TOKEN в Environment")
     if not BASE_URL:
         raise SystemExit("Нужен BASE_URL или RENDER_EXTERNAL_URL (Render задаёт автоматически)")
 
@@ -437,8 +463,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_refresh_charts, pattern=r"^refresh_charts$"))
     app.add_handler(CallbackQueryHandler(on_start_menu, pattern=r"^menu_(users|crypto|charts|chatid)$"))
     app.add_handler(CallbackQueryHandler(on_back_menu, pattern=r"^back_menu$"))
-    # Поддержка старых сообщений с callback="refresh"
-    app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh$"))
+    app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh$"))  # поддержка старых сообщений
 
     # Aliases
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!users\b", re.IGNORECASE)), handle_users))
