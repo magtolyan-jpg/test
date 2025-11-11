@@ -43,9 +43,9 @@ KB_START = InlineKeyboardMarkup([
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
     [InlineKeyboardButton("Crypto charts", callback_data="menu_charts")],
     [InlineKeyboardButton("Gas ETH", callback_data="menu_gas")],
-    [InlineKeyboardButton("Risk (RU)", callback_data="menu_risk")],
     [InlineKeyboardButton("ChatID", callback_data="menu_chatid")],
     [InlineKeyboardButton("Commands", callback_data="menu_cmds")],
+    [InlineKeyboardButton("Разбудить бота", callback_data="menu_wake")],  # ← добавлено
 ])
 
 def KB_USERS():
@@ -81,12 +81,6 @@ def KB_CHARTS_SELECT(coin: str, tf: str):
 def KB_GAS():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_gas")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
-    ])
-
-def KB_RISK():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_risk")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
     ])
 
@@ -281,6 +275,7 @@ async def handle_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fetch_24h_change("BTCUSDT"),
             fetch_24h_change("ETHUSDT"),
         )
+    # ... unchanged below
         btc, eth, usd_rub = mkt.get("BTC"), mkt.get("ETH"), mkt.get("USD_RUB")
         text = (
             f"BTC: {fmt_usd(btc)} ({fmt_pct(btc_chg) if btc_chg is not None else '—'} за 24ч)\n"
@@ -363,8 +358,8 @@ async def fetch_binance_series(symbol: str, interval: str, limit: int) -> List[T
 
 def tf_to_params(tf: str) -> Tuple[str, int]:
     if tf == "24h": return ("15m", 96)
-    if tf == "30d": return ("4h", 180)   # ~30 дней
-    return ("1h", 168)                    # 7d дефолт
+    if tf == "30d": return ("4h", 180)
+    return ("1h", 168)
 
 def nearest_price(series: List[Tuple[int, float]], target_ms: int) -> Optional[float]:
     if not series: return None
@@ -428,7 +423,6 @@ async def send_chart_for_pref(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 # ==== Gas ETH — через RPC (без ключей) ====
 async def rpc_fee_suggestions_gwei(rpc_url: str) -> Optional[Dict[str, float]]:
-    # Пытаемся взять feeHistory (5 блоков, перцентили 10/50/90)
     try:
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_feeHistory",
                    "params": ["0x5", "latest", [10, 50, 90]]}
@@ -441,53 +435,41 @@ async def rpc_fee_suggestions_gwei(rpc_url: str) -> Optional[Dict[str, float]]:
         reward_arr = data.get("reward") or []
         if len(base_arr) < 2 or not reward_arr:
             raise RuntimeError("feeHistory incomplete")
-
         def h2g(x): return int(x, 16) / 1e9
         base_last = h2g(base_arr[-1])
-        # усредним перцентили по блокам
         tips10 = [h2g(b[0]) for b in reward_arr if b and len(b) >= 1]
         tips50 = [h2g(b[1]) for b in reward_arr if b and len(b) >= 2]
         tips90 = [h2g(b[2]) for b in reward_arr if b and len(b) >= 3]
         def avg(a): return sum(a) / len(a) if a else 0.0
-        low = base_last + avg(tips10)
-        std = base_last + avg(tips50)
-        fast = base_last + avg(tips90)
+        low = base_last + avg(tips10); std = base_last + avg(tips50); fast = base_last + avg(tips90)
         return {"base": max(base_last, 0.0), "low": max(low, 0.0), "std": max(std, 0.0), "fast": max(fast, 0.0)}
     except Exception:
-        # fallback: eth_gasPrice
         try:
             payload = {"jsonrpc": "2.0", "id": 2, "method": "eth_gasPrice", "params": []}
             async with httpx.AsyncClient(timeout=8, headers={"Content-Type": "application/json"}) as client:
                 r = await client.post(rpc_url, json=payload)
-                if r.status_code != 200:
-                    return None
+                if r.status_code != 200: return None
                 gp_hex = (r.json() or {}).get("result")
             gwei = int(gp_hex, 16) / 1e9 if gp_hex else 0.0
-            if gwei <= 0:
-                return None
+            if gwei <= 0: return None
             return {"base": gwei, "low": gwei * 0.9, "std": gwei, "fast": gwei * 1.1}
         except Exception:
             return None
 
 def estimate_fee_usd(gwei: Optional[float], gas_units: int, eth_usd: Optional[float]) -> Optional[float]:
-    if gwei is None or eth_usd is None:
-        return None
+    if gwei is None or eth_usd is None: return None
     eth_cost = (gwei * 1e-9) * gas_units
     return eth_cost * eth_usd
 
 async def handle_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # ETH mainnet через RPC (publicnode → ankr)
         main_sug = await rpc_fee_suggestions_gwei(ETH_RPC1) or await rpc_fee_suggestions_gwei(ETH_RPC2)
-        # Abstract по RPC
         abs_sug = await rpc_fee_suggestions_gwei(ABSTRACT_RPC) if ABSTRACT_RPC else None
         mkt = await get_market_cached(force=False)
         eth_usd = mkt.get("ETH")
-
         if main_sug:
             base = main_sug["base"]; low = main_sug["low"]; std = main_sug["std"]; fast = main_sug["fast"]
-            tx_usd = estimate_fee_usd(std, 21_000, eth_usd)
-            swap_usd = estimate_fee_usd(std, 100_000, eth_usd)
+            tx_usd = estimate_fee_usd(std, 21_000, eth_usd); swap_usd = estimate_fee_usd(std, 100_000, eth_usd)
             main_text = (
                 "ETH Mainnet\n"
                 f"Base: {base:.1f} gwei\n"
@@ -496,7 +478,6 @@ async def handle_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             main_text = "ETH Mainnet\n— не удалось получить газ по RPC"
-
         if ABSTRACT_RPC:
             if abs_sug:
                 a_std = abs_sug["std"]
@@ -511,7 +492,6 @@ async def handle_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 abs_text = "Abstract\n— не удалось получить газ по RPC (проверьте доступность)"
         else:
             abs_text = "Abstract\n— не настроено (добавьте ABSTRACT_RPC)"
-
         text = f"{main_text}\n\n{abs_text}"
         await update.effective_message.reply_text(text, reply_markup=KB_GAS())
     except Exception:
@@ -547,33 +527,26 @@ async def handle_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not src or not dst or src == dst:
         await update.effective_message.reply_text("Поддержка: usd, rub, btc, eth, bnb. Пример: /convert 100 usd rub")
         return
-
     mkt = await get_market_cached(force=True)
     btc, eth, bnb, usd_rub = mkt.get("BTC"), mkt.get("ETH"), mkt.get("BNB"), mkt.get("USD_RUB")
     if any(v is None for v in (btc, eth, usd_rub)) or (src == "bnb" or dst == "bnb") and (bnb is None):
         await update.effective_message.reply_text("Нет котировок для конвертации, попробуйте ещё раз.")
         return
-
-    # src -> USD
     usd = None
     if src == "usd": usd = amount
     elif src == "rub": usd = amount / usd_rub
     elif src == "btc": usd = amount * btc
     elif src == "eth": usd = amount * eth
     elif src == "bnb": usd = amount * bnb
-
-    # USD -> dst
     out = None
     if dst == "usd": out = usd
     elif dst == "rub": out = usd * usd_rub
     elif dst == "btc": out = usd / btc
     elif dst == "eth": out = usd / eth
     elif dst == "bnb": out = usd / bnb
-
     if out is None:
         await update.effective_message.reply_text("Не удалось конвертировать.")
         return
-
     def fmt_unit(u: str, v: float) -> str:
         if u == "usd": return fmt_usd(v)
         if u == "rub": return fmt_rub(v)
@@ -581,7 +554,6 @@ async def handle_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if u == "eth": return f"{v:.8f} ETH"
         if u == "bnb": return f"{v:.8f} BNB"
         return str(v)
-
     await update.effective_message.reply_text(
         f"{amount:g} {src.upper()} = {fmt_unit(dst, out)}",
         disable_web_page_preview=True
@@ -592,12 +564,12 @@ async def handle_cmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "Commands:\n"
         "• /convert 0.05 btc rub — конвертация (usd/rub/btc/eth/bnb)\n"
-        "• /risk — country risk (RU) с рекомендацией\n"
         "• /charts — открыть меню графиков (BTC/ETH, 24h/7d/30d)\n"
         "• /gas — газ ETH mainnet + Abstract\n"
         "• /users — Giga users/juiced\n"
         "• /crypto — цены BTC/ETH + USD/RUB\n"
-        "• /chatid — ID текущего чата"
+        "• /chatid — ID текущего чата\n"
+        "• /wake — Разбудить бота"
     )
     await update.effective_message.reply_text(txt, reply_markup=KB_COMMANDS(), disable_web_page_preview=True)
 
@@ -669,115 +641,13 @@ async def charts_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     await send_chart_for_pref(update.effective_chat.id, context)
 
-# ==== RISK (RU) ====
-async def fetch_wb_cpi_yoy_ru() -> Optional[float]:
-    # World Bank CPI YoY (последнее доступное)
-    url = "https://api.worldbank.org/v2/country/RUS/indicator/FP.CPI.TOTL.ZG"
-    params = {"format": "json", "per_page": "60"}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-        rows = data[1] if isinstance(data, list) and len(data) > 1 else []
-        for row in rows:
-            val = row.get("value")
-            if isinstance(val, (int, float)):
-                return float(val)
-    except Exception:
-        pass
-    return None
-
-async def fetch_usd_rub_ts_30d() -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    # Возвращает (last, first, pct_change_30d)
-    try:
-        end = datetime.utcnow().date()
-        start = end - timedelta(days=35)
-        url = "https://api.exchangerate.host/timeseries"
-        params = {
-            "base": "USD",
-            "symbols": "RUB",
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            js = r.json()
-        rates = js.get("rates", {})
-        if not isinstance(rates, dict) or not rates:
-            return None, None, None
-        days_sorted = sorted(d for d in rates.keys() if "RUB" in rates[d])
-        if not days_sorted:
-            return None, None, None
-        first_rate = float(rates[days_sorted[0]]["RUB"])
-        last_rate = float(rates[days_sorted[-1]]["RUB"])
-        pct = (last_rate / first_rate - 1.0) * 100.0 if first_rate > 0 else None
-        return last_rate, first_rate, pct
-    except Exception:
-        return None, None, None
-
-def make_risk_verdict(cpi_yoy: Optional[float], fx_30d_pct: Optional[float]) -> Tuple[str, str]:
-    # Простая эвристика
-    level = "низкий"
-    if fx_30d_pct is not None and fx_30d_pct >= 15:
-        level = "высокий"
-    elif fx_30d_pct is not None and fx_30d_pct >= 7:
-        level = "средний"
-    elif cpi_yoy is not None and cpi_yoy >= 10:
-        level = "средний"
-    # Рекомендация
-    if level == "низкий":
-        rec = "держите 3–6 мес. подушку в USD/EUR; рублёвые инструменты — короткие сроки; следите за MoM и курсом (+10–15%/30д — усилить защиту)"
-    elif level == "средний":
-        rec = "увеличьте долю FX/вне локального риска; избегайте длинных рублевых фиксов; запас наличного FX; 2–3 платёжных канала"
-    else:
-        rec = "сократите рублёвую экспозицию; ликвидный FX (частично наличный); избегайте валютных долгов; минимальные сроки, готовность к лимитам"
-    return level, rec
-
-def format_risk_ru(cpi_yoy: Optional[float], fx_last: Optional[float], fx_30d_pct: Optional[float]) -> str:
-    parts = []
-    parts.append("Country risk — Russia (RU)")
-    fx_line = f"USD/RUB (market): {fx_last:.2f}" if isinstance(fx_last, (int, float)) else "USD/RUB (market): —"
-    chg_line = f"30д: {fx_30d_pct:+.1f}%" if isinstance(fx_30d_pct, (int, float)) else "30д: —"
-    parts.append(f"FX\n- {fx_line}\n- {chg_line}")
-    cpi_line = f"{cpi_yoy:.1f}%" if isinstance(cpi_yoy, (int, float)) else "—"
-    parts.append(f"Цены\n- CPI YoY (WB): {cpi_line}")
-    level, rec = make_risk_verdict(cpi_yoy, fx_30d_pct)
-    parts.append(f"Вердикт\n- Риск: {level} ({rec})")
-    return "\n".join(parts)
-
-async def handle_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        (fx_last, fx_first, fx_30d_pct), cpi_yoy = await asyncio.gather(
-            fetch_usd_rub_ts_30d(),
-            fetch_wb_cpi_yoy_ru()
-        )
-        txt = format_risk_ru(cpi_yoy, fx_last, fx_30d_pct)
-        await update.effective_message.reply_text(txt, reply_markup=KB_RISK())
-    except Exception:
-        log.exception("/risk failed")
-        await update.effective_message.reply_text("Не удалось собрать данные для оценки риска.")
-
-async def on_refresh_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    try:
-        await q.answer("Обновляю…", cache_time=0)
-    except Exception:
-        pass
-    try:
-        (fx_last, fx_first, fx_30d_pct), cpi_yoy = await asyncio.gather(
-            fetch_usd_rub_ts_30d(),
-            fetch_wb_cpi_yoy_ru()
-        )
-        txt = format_risk_ru(cpi_yoy, fx_last, fx_30d_pct)
-        try:
-            await q.edit_message_text(txt, reply_markup=KB_RISK())
-        except Exception:
-            await q.message.reply_text(txt, reply_markup=KB_RISK())
-    except Exception:
-        log.exception("refresh risk failed")
-        await q.message.reply_text("Не удалось обновить данные риска.")
+# ==== Wake ====
+async def handle_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Нажатие кнопки/команда — просто подтверждаем, что инстанс «проснулся»
+    if update.callback_query:
+        try: await update.callback_query.answer("Проверяю…", cache_time=0)
+        except Exception: pass
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Готов к работе", reply_markup=KB_BACK())
 
 # ==== start/menu/chatid ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -807,12 +677,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_charts_menu(update, context)
     elif data == "menu_gas":
         await handle_gas(update, context)
-    elif data == "menu_risk":
-        await handle_risk(update, context)
     elif data == "menu_chatid":
         await chatid(update, context)
     elif data == "menu_cmds":
         await handle_cmds(update, context)
+    elif data == "menu_wake":
+        await handle_wake(update, context)
 
 async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -842,29 +712,27 @@ def main():
     app.add_handler(CommandHandler("conv", handle_convert))
     app.add_handler(CommandHandler("charts", handle_charts_menu))
     app.add_handler(CommandHandler("gas", handle_gas))
-    app.add_handler(CommandHandler("risk", handle_risk))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("cmds", handle_cmds))
+    app.add_handler(CommandHandler("wake", handle_wake))  # ← команда
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh_users$"))
     app.add_handler(CallbackQueryHandler(on_refresh_crypto, pattern=r"^refresh_crypto$"))
     app.add_handler(CallbackQueryHandler(on_refresh_snapshot, pattern=r"^refresh_snapshot$"))
     app.add_handler(CallbackQueryHandler(on_refresh_gas, pattern=r"^refresh_gas$"))
-    app.add_handler(CallbackQueryHandler(on_refresh_risk, pattern=r"^refresh_risk$"))
-    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|risk|chatid|cmds)$"))
+    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|chatid|cmds|wake)$"))
     app.add_handler(CallbackQueryHandler(charts_set_coin, pattern=r"^charts_coin_(BTC|ETH)$"))
     app.add_handler(CallbackQueryHandler(charts_set_tf, pattern=r"^charts_tf_(24h|7d|30d)$"))
     app.add_handler(CallbackQueryHandler(charts_refresh, pattern=r"^charts_refresh$"))
     app.add_handler(CallbackQueryHandler(on_back_menu, pattern=r"^back_menu$"))
-    app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh$"))  # legacy
 
     # Aliases
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!users\b", re.IGNORECASE)), handle_users))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!crypto\b", re.IGNORECASE)), handle_crypto))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts_menu))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!gas\b", re.IGNORECASE)), handle_gas))
-    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!risk\b", re.IGNORECASE)), handle_risk))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!wake\b", re.IGNORECASE)), handle_wake))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!(?:convert|conv)\b", re.IGNORECASE)), handle_convert))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!cmds\b", re.IGNORECASE)), handle_cmds))
 
