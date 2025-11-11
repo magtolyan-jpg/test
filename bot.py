@@ -13,30 +13,46 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 
-# Загружаем .env из папки скрипта
+# Загружаем .env из папки скрипта (Render тоже прокинет переменные окружения)
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 API_URL = os.getenv("API_URL", "https://giganoob.com/data/html/users_snapshot.json").strip()
 CHANNEL = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()   # @username или -100...
-CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))            # кэш для /users, сек
-CRYPTO_CACHE_TTL = int(os.getenv("CRYPTO_CACHE_TTL", "30"))  # кэш для /crypto, сек
+CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))            # кэш /users, сек
+CRYPTO_CACHE_TTL = int(os.getenv("CRYPTO_CACHE_TTL", "30"))  # кэш /crypto, сек
 
-# Параметры webhook/сервера
-PORT = int(os.getenv("PORT", "8000"))
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook")  # без начального слеша
+# Webhook/сервер для Render
+PORT = int(os.getenv("PORT", "10000"))  # Render прокидывает PORT
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook").strip()
 BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-# Кнопки
-KB_REFRESH = InlineKeyboardMarkup([[InlineKeyboardButton("⟳ Обновить", callback_data="refresh")]])
+# Кнопки меню
 KB_START = InlineKeyboardMarkup([
     [InlineKeyboardButton("Giga users", callback_data="menu_users")],
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
     [InlineKeyboardButton("ChatID", callback_data="menu_chatid")],
 ])
+
+def KB_USERS():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_users")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+def KB_CRYPTO():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_crypto")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+def KB_BACK():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; UsersJuicedBot/1.0)",
@@ -49,7 +65,7 @@ CRYPTO_HEADERS = {
     "Accept": "application/json",
 }
 
-# ============ Утилиты ============
+# ========= Утилиты =========
 def parse_channel_id(val: str) -> str | int | None:
     if not val:
         return None
@@ -78,7 +94,7 @@ def cache_busted(url: str) -> str:
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}t={int(time.time() * 1000)}"
 
-# ============ /users (giganoob) ============
+# ========= /users =========
 _fetch_lock = asyncio.Lock()
 _cache_ts = 0.0
 _cache_data: Tuple[Optional[int], Optional[int]] = (None, None)
@@ -97,14 +113,10 @@ async def fetch_stats() -> Tuple[Optional[int], Optional[int]]:
         else:
             users = data.get("users")
             juiced = data.get("juiced")
-    try:
-        users = int(users) if users is not None else None
-    except Exception:
-        users = None
-    try:
-        juiced = int(juiced) if juiced is not None else None
-    except Exception:
-        juiced = None
+    try: users = int(users) if users is not None else None
+    except Exception: users = None
+    try: juiced = int(juiced) if juiced is not None else None
+    except Exception: juiced = None
     return users, juiced
 
 async def get_stats_cached(force: bool = False) -> Tuple[Optional[int], Optional[int]]:
@@ -133,7 +145,7 @@ def format_users_message(users, juiced) -> str:
 async def send_users(chat_id: int | str, bot) -> None:
     users, juiced = await get_stats_cached(force=False)
     msg = format_users_message(users, juiced)
-    await bot.send_message(chat_id=chat_id, text=msg, reply_markup=KB_REFRESH, disable_web_page_preview=True)
+    await bot.send_message(chat_id=chat_id, text=msg, reply_markup=KB_USERS(), disable_web_page_preview=True)
 
 async def handle_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -142,7 +154,7 @@ async def handle_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("handle_users failed")
         await update.effective_message.reply_text("Не удалось получить данные с сайта.")
 
-async def on_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_refresh_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
         await q.answer("Обновляю…", cache_time=0)
@@ -152,14 +164,14 @@ async def on_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users, juiced = await get_stats_cached(force=True)
         msg = format_users_message(users, juiced)
         try:
-            await q.edit_message_text(msg, reply_markup=KB_REFRESH)
+            await q.edit_message_text(msg, reply_markup=KB_USERS())
         except Exception:
-            await q.message.reply_text(msg, reply_markup=KB_REFRESH)
+            await q.message.reply_text(msg, reply_markup=KB_USERS())
     except Exception:
-        log.exception("refresh failed")
+        log.exception("refresh users failed")
         await q.message.reply_text("Не удалось обновить данные.")
 
-# ============ /crypto (BTC, ETH + USD/RUB) ============
+# ========= /crypto =========
 _market_cache_ts = 0.0
 _market_cache: Dict[str, Optional[float]] = {"BTC": None, "ETH": None, "USD_RUB": None}
 
@@ -191,8 +203,7 @@ async def fetch_usd_rub() -> Optional[float]:
         try:
             r = await client.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "RUB"})
             if r.status_code == 200:
-                data = r.json()
-                rate = data.get("rates", {}).get("RUB")
+                rate = r.json().get("rates", {}).get("RUB")
                 if isinstance(rate, (int, float)):
                     return float(rate)
         except Exception:
@@ -200,8 +211,7 @@ async def fetch_usd_rub() -> Optional[float]:
         try:
             r = await client.get("https://open.er-api.com/v6/latest/USD")
             if r.status_code == 200:
-                data = r.json()
-                rate = data.get("rates", {}).get("RUB")
+                rate = r.json().get("rates", {}).get("RUB")
                 if isinstance(rate, (int, float)):
                     return float(rate)
         except Exception:
@@ -221,20 +231,43 @@ async def get_market_cached(force: bool = False) -> Dict[str, Optional[float]]:
 async def handle_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await get_market_cached(force=False)
-        btc = data.get("BTC"); eth = data.get("ETH"); usd_rub = data.get("USD_RUB")
+        btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
         text = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_rub(usd_rub)}"
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text, reply_markup=KB_CRYPTO())
     except Exception:
         log.exception("/crypto failed")
         await update.effective_message.reply_text("Не удалось получить цены BTC/ETH или курс USD/RUB.")
 
-# ============ Старт-меню и сервис ============
+async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer("Обновляю…", cache_time=0)
+    except Exception:
+        pass
+    try:
+        data = await get_market_cached(force=True)
+        btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
+        msg = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_rub(usd_rub)}"
+        try:
+            await q.edit_message_text(msg, reply_markup=KB_CRYPTO())
+        except Exception:
+            await q.message.reply_text(msg, reply_markup=KB_CRYPTO())
+    except Exception:
+        log.exception("refresh crypto failed")
+        await q.message.reply_text("Не удалось обновить цены/курс.")
+
+# ========= /start и ChatID =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Выберите действие:", reply_markup=KB_START)
 
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    await update.effective_message.reply_text(f"chat_id: {chat.id} ({chat.type})")
+    await update.effective_message.reply_text(
+        f"chat_id: {chat.id}\n"
+        f"type: {chat.type}\n"
+        f"title: {chat.title or '-'}",
+        reply_markup=KB_BACK()
+    )
 
 async def on_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -249,34 +282,57 @@ async def on_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_crypto":
         await handle_crypto(update, context)
     elif data == "menu_chatid":
-        await context.bot.send_message(chat_id=chat_id, text=f"chat_id: {chat_id} ({update.effective_chat.type})")
+        chat = update.effective_chat
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"chat_id: {chat.id}\n"
+                 f"type: {chat.type}\n"
+                 f"title: {chat.title or '-'}",
+            reply_markup=KB_BACK()
+        )
 
-# ============ запуск (webhook) ============
+async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    # Пробуем отредактировать текущее сообщение, если нельзя — шлём новое
+    try:
+        await q.edit_message_text("Выберите действие:", reply_markup=KB_START)
+    except Exception:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=KB_START)
+
+# ========= запуск (webhook) =========
 def main():
     if not TOKEN:
         raise SystemExit("Заполните TELEGRAM_TOKEN в .env")
-
     if not BASE_URL:
-        raise SystemExit("Нужно BASE_URL или переменная RENDER_EXTERNAL_URL (полный https URL сервиса)")
+        raise SystemExit("Нужен BASE_URL или RENDER_EXTERNAL_URL (Render задаёт автоматически)")
 
     app = Application.builder().token(TOKEN).build()
 
-    # handlers
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("users", handle_users))
     app.add_handler(CommandHandler("crypto", handle_crypto))
     app.add_handler(CommandHandler("chatid", chatid))
 
-    app.add_handler(CallbackQueryHandler(on_refresh, pattern=r"^refresh$"))
+    # Кнопки
+    app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh_users$"))
+    app.add_handler(CallbackQueryHandler(on_refresh_crypto, pattern=r"^refresh_crypto$"))
     app.add_handler(CallbackQueryHandler(on_start_menu, pattern=r"^menu_(users|crypto|chatid)$"))
+    app.add_handler(CallbackQueryHandler(on_back_menu, pattern=r"^back_menu$"))
+    # Поддержка старых сообщений с callback="refresh"
+    app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh$"))
 
+    # Алиасы через текст
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!users\b", re.IGNORECASE)), handle_users))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!crypto\b", re.IGNORECASE)), handle_crypto))
 
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     log.info("Starting webhook on port %s, path '/%s', webhook_url=%s", PORT, WEBHOOK_PATH, webhook_url)
 
-    # run_webhook сам выставит setWebhook на webhook_url
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
