@@ -6,7 +6,6 @@ import logging
 import asyncio
 from pathlib import Path
 from typing import Tuple, Optional, Dict, List
-from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -15,7 +14,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 
-# Load env
+# Load env (Render прокинет переменные окружения)
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -28,14 +27,10 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook").strip()
 BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
-# CoinGecko API key (обязателен для графиков)
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "CG-Demo-API-Key").strip()
-CHART_CACHE_TTL = int(os.getenv("CHART_CACHE_TTL", "120"))  # кэш истории для графиков, сек
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-# Keyboards
+# Кнопки
 KB_START = InlineKeyboardMarkup([
     [InlineKeyboardButton("Giga users", callback_data="menu_users")],
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
@@ -62,9 +57,7 @@ def KB_CHARTS():
     ])
 
 def KB_BACK():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; UsersJuicedBot/1.0)",
@@ -76,14 +69,8 @@ CRYPTO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; CryptoPrices/1.0)",
     "Accept": "application/json",
 }
-CG_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; CoinGeckoCharts/1.0)",
-    "Accept": "application/json",
-    "x-cg-demo-api-key": COINGECKO_API_KEY,   # для бесплатного: CG-Demo-API-Key, для платного: свой ключ
-    # Если у вас Pro-ключ, вместо строки выше можно добавить: "x-cg-pro-api-key": COINGECKO_API_KEY
-}
 
-# Utils
+# ================= utils =================
 def fmt_int(n: Optional[int]) -> str:
     return f"{n:,}".replace(",", " ") if isinstance(n, int) else "—"
 
@@ -113,7 +100,7 @@ def cache_busted(url: str) -> str:
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}t={int(time.time() * 1000)}"
 
-# ========== /users ==========
+# ================ /users =================
 _fetch_lock = asyncio.Lock()
 _cache_ts = 0.0
 _cache_data: Tuple[Optional[int], Optional[int]] = (None, None)
@@ -163,8 +150,7 @@ def format_users_message(users, juiced) -> str:
 
 async def send_users(chat_id: int | str, bot) -> None:
     users, juiced = await get_stats_cached(force=False)
-    msg = format_users_message(users, juiced)
-    await bot.send_message(chat_id=chat_id, text=msg, reply_markup=KB_USERS(), disable_web_page_preview=True)
+    await bot.send_message(chat_id=chat_id, text=format_users_message(users, juiced), reply_markup=KB_USERS(), disable_web_page_preview=True)
 
 async def handle_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -188,7 +174,7 @@ async def on_refresh_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh users failed")
         await q.message.reply_text("Не удалось обновить данные.")
 
-# ========== /crypto (BTC, ETH + USD/RUB) ==========
+# ================ /crypto =================
 _market_cache_ts = 0.0
 _market_cache: Dict[str, Optional[float]] = {"BTC": None, "ETH": None, "USD_RUB": None}
 
@@ -248,8 +234,7 @@ async def get_market_cached(force: bool = False) -> Dict[str, Optional[float]]:
 async def handle_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await get_market_cached(force=False)
-        btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
-        text = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_rub(usd_rub)}"
+        text = f"BTC: {fmt_usd(data.get('BTC'))}\nETH: {fmt_usd(data.get('ETH'))}\nUSD/RUB: {fmt_rub(data.get('USD_RUB'))}"
         await update.effective_message.reply_text(text, reply_markup=KB_CRYPTO())
     except Exception:
         log.exception("/crypto failed")
@@ -261,8 +246,7 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     try:
         data = await get_market_cached(force=True)
-        btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
-        msg = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_rub(usd_rub)}"
+        msg = f"BTC: {fmt_usd(data.get('BTC'))}\nETH: {fmt_usd(data.get('ETH'))}\nUSD/RUB: {fmt_rub(data.get('USD_RUB'))}"
         try:
             await q.edit_message_text(msg, reply_markup=KB_CRYPTO())
         except Exception:
@@ -271,30 +255,24 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh crypto failed")
         await q.message.reply_text("Не удалось обновить цены/курс.")
 
-# ========== Crypto charts (PNG, 7d) ==========
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-_chart_cache: Dict[str, Tuple[float, List[Tuple[int, float]]]] = {}  # coin_id -> (ts, series)
-
-async def fetch_cg_chart(coin_id: str, days: int = 7, interval: str = "hourly") -> List[Tuple[int, float]]:
-    # cache
-    ts_now = time.monotonic()
-    cached = _chart_cache.get(coin_id)
-    if cached and (ts_now - cached[0]) < CHART_CACHE_TTL:
-        return cached[1]
-
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
-    params = {"vs_currency": "usd", "days": str(days), "interval": interval}
-    async with httpx.AsyncClient(timeout=20, headers=CG_HEADERS) as client:
+# ============== Crypto charts (PNG, 7d, без ключей — Binance Klines) ==============
+# Берём часовые свечи за 7 дней (168 свечей) с Binance
+async def fetch_binance_series(symbol: str, limit: int = 168) -> List[Tuple[int, float]]:
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": "1h", "limit": str(limit)}
+    async with httpx.AsyncClient(timeout=20, headers=CRYPTO_HEADERS) as client:
         r = await client.get(url, params=params)
-        if r.status_code == 401:
-            # Не задан/не принят ключ — отдадим пусто, обработаем выше
-            raise httpx.HTTPStatusError("401 from CoinGecko - set COINGECKO_API_KEY", request=r.request, response=r)
         r.raise_for_status()
-        data = r.json()
-
-    prices = data.get("prices") or []
-    series = [(int(p[0]), float(p[1])) for p in prices if isinstance(p, list) and len(p) >= 2]
-    _chart_cache[coin_id] = (ts_now, series)
+        arr = r.json()
+    # kline формат: [openTime, open, high, low, close, volume, closeTime, ...]
+    series: List[Tuple[int, float]] = []
+    for k in arr:
+        try:
+            ts = int(k[6])  # closeTime (ms)
+            close = float(k[4])
+            series.append((ts, close))
+        except Exception:
+            continue
     return series
 
 def nearest_price(series: List[Tuple[int, float]], target_ms: int) -> Optional[float]:
@@ -303,10 +281,10 @@ def nearest_price(series: List[Tuple[int, float]], target_ms: int) -> Optional[f
     idx = min(range(len(series)), key=lambda i: abs(series[i][0] - target_ms))
     return series[idx][1]
 
-def calc_changes(series: List[Tuple[int, float]]) -> Dict[str, Optional[float]]:
+def calc_changes_from_series(series: List[Tuple[int, float]]) -> Dict[str, Optional[float]]:
     if not series:
         return {"now": None, "d1h": None, "p1h": None, "d6h": None, "p6h": None, "d24h": None, "p24h": None}
-    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    now_ms = series[-1][0]
     now_price = series[-1][1]
     out = {"now": now_price}
     for label, hours in (("1h", 1), ("6h", 6), ("24h", 24)):
@@ -352,30 +330,18 @@ async def render_chart_png(config: Dict, width: int = 800, height: int = 400) ->
         return r.content
 
 async def send_coin_chart(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
-                          coin_id: str, symbol: str, color: str) -> None:
-    try:
-        series = await fetch_cg_chart(coin_id, days=7, interval="hourly")
-    except httpx.HTTPStatusError as e:
-        if e.response is not None and e.response.status_code == 401:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="CoinGecko вернул 401 (нужен API key). "
-                     "В Render → Environment добавьте COINGECKO_API_KEY=CG-Demo-API-Key "
-                     "или свой ключ с coingecko."
-            )
-            return
-        raise
-
+                          symbol_pair: str, symbol_short: str, color: str) -> None:
+    # symbol_pair: "BTCUSDT" / "ETHUSDT"
+    series = await fetch_binance_series(symbol_pair, limit=168)
     if not series:
-        await context.bot.send_message(chat_id=chat_id, text=f"{symbol}: не удалось получить данные.")
+        await context.bot.send_message(chat_id=chat_id, text=f"{symbol_short}: не удалось получить данные.")
         return
-
-    cfg = make_chart_config(series, f"{symbol} 7d", color)
+    cfg = make_chart_config(series, f"{symbol_short} 7d", color)
     png = await render_chart_png(cfg)
 
-    chg = calc_changes(series)
+    chg = calc_changes_from_series(series)
     now = chg.get("now")
-    cap_lines = [f"{symbol}: {fmt_usd(now)}"]
+    cap_lines = [f"{symbol_short}: {fmt_usd(now)}"]
     cap_lines.append(f"1ч: {fmt_usd_delta(chg.get('d1h'))} ({fmt_pct(chg.get('p1h'))})")
     cap_lines.append(f"6ч: {fmt_usd_delta(chg.get('d6h'))} ({fmt_pct(chg.get('p6h'))})")
     cap_lines.append(f"24ч: {fmt_usd_delta(chg.get('d24h'))} ({fmt_pct(chg.get('p24h'))})")
@@ -384,8 +350,8 @@ async def send_coin_chart(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE
     await context.bot.send_photo(chat_id=chat_id, photo=io.BytesIO(png), caption=caption)
 
 async def send_charts_pack(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE):
-    await send_coin_chart(chat_id, context, "bitcoin", "BTC", "#f2a900")
-    await send_coin_chart(chat_id, context, "ethereum", "ETH", "#3c3c3d")
+    await send_coin_chart(chat_id, context, "BTCUSDT", "BTC", "#f2a900")
+    await send_coin_chart(chat_id, context, "ETHUSDT", "ETH", "#3c3c3d")
     await context.bot.send_message(chat_id=chat_id, text="Crypto charts (7d)", reply_markup=KB_CHARTS())
 
 async def handle_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -397,18 +363,13 @@ async def on_refresh_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     await send_charts_pack(update.effective_chat.id, context)
 
-# ========== Start / menu / chatid ==========
+# ================ старт/меню/chatid =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Выберите действие:", reply_markup=KB_START)
 
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    await update.effective_message.reply_text(
-        f"chat_id: {chat.id}\n"
-        f"type: {chat.type}\n"
-        f"title: {chat.title or '-'}",
-        reply_markup=KB_BACK()
-    )
+    c = update.effective_chat
+    await update.effective_message.reply_text(f"chat_id: {c.id}\ntype: {c.type}\ntitle: {c.title or '-'}", reply_markup=KB_BACK())
 
 async def on_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -423,14 +384,8 @@ async def on_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_charts":
         await send_charts_pack(chat_id, context)
     elif data == "menu_chatid":
-        chat = update.effective_chat
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"chat_id: {chat.id}\n"
-                 f"type: {chat.type}\n"
-                 f"title: {chat.title or '-'}",
-            reply_markup=KB_BACK()
-        )
+        c = update.effective_chat
+        await context.bot.send_message(chat_id=c.id, text=f"chat_id: {c.id}\ntype: {c.type}\ntitle: {c.title or '-'}", reply_markup=KB_BACK())
 
 async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -441,7 +396,7 @@ async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=KB_START)
 
-# ========== run webhook ==========
+# ================= run webhook =================
 def main():
     if not TOKEN:
         raise SystemExit("Заполните TELEGRAM_TOKEN в Environment")
