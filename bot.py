@@ -27,20 +27,23 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook").strip()
 BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
-# Abstract RPC (по умолчанию ваш mainnet endpoint)
+# RPCs
 ABSTRACT_RPC = os.getenv("ABSTRACT_RPC", "https://api.mainnet.abs.xyz").strip()
+ETH_RPC1 = os.getenv("ETH_RPC1", "https://ethereum-rpc.publicnode.com").strip()
+ETH_RPC2 = os.getenv("ETH_RPC2", "https://rpc.ankr.com/eth").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
 # ==== Keyboards ====
 KB_START = InlineKeyboardMarkup([
-    [InlineKeyboardButton("Snapshot", callback_data="menu_snapshot")],
+    [InlineKeyboardButton("All stats", callback_data="menu_snapshot")],
     [InlineKeyboardButton("Giga users", callback_data="menu_users")],
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
     [InlineKeyboardButton("Crypto charts", callback_data="menu_charts")],
     [InlineKeyboardButton("Gas ETH", callback_data="menu_gas")],
     [InlineKeyboardButton("ChatID", callback_data="menu_chatid")],
+    [InlineKeyboardButton("Commands", callback_data="menu_cmds")],
 ])
 
 def KB_USERS():
@@ -61,12 +64,6 @@ def KB_SNAPSHOT():
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
     ])
 
-def KB_GAS():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_gas")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
-    ])
-
 def KB_CHARTS_SELECT(coin: str, tf: str):
     def mark(x, cur): return f"{x} ✓" if x == cur else x
     return InlineKeyboardMarkup([
@@ -77,6 +74,17 @@ def KB_CHARTS_SELECT(coin: str, tf: str):
          InlineKeyboardButton(mark("30d", tf), callback_data="charts_tf_30d")],
         [InlineKeyboardButton("⟳ Обновить", callback_data="charts_refresh"),
          InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+def KB_GAS():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_gas")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+def KB_COMMANDS():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]
     ])
 
 def KB_BACK():
@@ -100,6 +108,10 @@ def fmt_int(n: Optional[int]) -> str:
 def fmt_usd(n: Optional[float]) -> str:
     if n is None: return "—"
     return f"{n:,.0f} $".replace(",", " ")
+
+def fmt_usd_short(n: Optional[float]) -> str:
+    if n is None: return "—"
+    return f"{n:,.2f} $".replace(",", " ")
 
 def fmt_usd_delta(d: Optional[float]) -> str:
     if d is None: return "—"
@@ -190,27 +202,29 @@ async def on_refresh_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==== Crypto prices & helpers ====
 _market_cache_ts = 0.0
-_market_cache: Dict[str, Optional[float]] = {"BTC": None, "ETH": None, "USD_RUB": None}
+_market_cache: Dict[str, Optional[float]] = {"BTC": None, "ETH": None, "BNB": None, "USD_RUB": None}
 
 async def fetch_crypto_prices() -> Dict[str, Optional[float]]:
-    prices: Dict[str, Optional[float]] = {"BTC": None, "ETH": None}
+    prices: Dict[str, Optional[float]] = {"BTC": None, "ETH": None, "BNB": None}
     async with httpx.AsyncClient(timeout=15, headers=CRYPTO_HEADERS, follow_redirects=True) as client:
         try:
             b_btc = await client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"})
             b_eth = await client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "ETHUSDT"})
-            if b_btc.status_code == 200 and b_eth.status_code == 200:
-                prices["BTC"] = float(b_btc.json()["price"])
-                prices["ETH"] = float(b_eth.json()["price"])
-                return prices
-        except Exception: pass
+            b_bnb = await client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BNBUSDT"})
+            if b_btc.status_code == 200: prices["BTC"] = float(b_btc.json()["price"])
+            if b_eth.status_code == 200: prices["ETH"] = float(b_eth.json()["price"])
+            if b_bnb.status_code == 200: prices["BNB"] = float(b_bnb.json()["price"])
+            return prices
+        except Exception:
+            pass
+        # Fallback Coinbase для BTC/ETH (BNB там нет)
         try:
             c_btc = await client.get("https://api.coinbase.com/v2/prices/BTC-USD/spot")
             c_eth = await client.get("https://api.coinbase.com/v2/prices/ETH-USD/spot")
-            if c_btc.status_code == 200 and c_eth.status_code == 200:
-                prices["BTC"] = float(c_btc.json()["data"]["amount"])
-                prices["ETH"] = float(c_eth.json()["data"]["amount"])
-                return prices
-        except Exception: pass
+            if c_btc.status_code == 200: prices["BTC"] = float(c_btc.json()["data"]["amount"])
+            if c_eth.status_code == 200: prices["ETH"] = float(c_eth.json()["data"]["amount"])
+        except Exception:
+            pass
     return prices
 
 async def fetch_usd_rub() -> Optional[float]:
@@ -230,7 +244,6 @@ async def fetch_usd_rub() -> Optional[float]:
     return None
 
 async def fetch_24h_change(symbol: str) -> Optional[float]:
-    # Binance 24h ticker: priceChangePercent
     url = "https://api.binance.com/api/v3/ticker/24hr"
     async with httpx.AsyncClient(timeout=15, headers=CRYPTO_HEADERS, follow_redirects=True) as client:
         r = await client.get(url, params={"symbol": symbol})
@@ -248,7 +261,7 @@ async def get_market_cached(force: bool = False) -> Dict[str, Optional[float]]:
     if not force and (now - _market_cache_ts) < CRYPTO_CACHE_TTL and any(_market_cache.values()):
         return _market_cache
     prices, usd_rub = await asyncio.gather(fetch_crypto_prices(), fetch_usd_rub())
-    _market_cache = {"BTC": prices.get("BTC"), "ETH": prices.get("ETH"), "USD_RUB": usd_rub}
+    _market_cache = {"BTC": prices.get("BTC"), "ETH": prices.get("ETH"), "BNB": prices.get("BNB"), "USD_RUB": usd_rub}
     _market_cache_ts = time.monotonic()
     return _market_cache
 
@@ -293,7 +306,7 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh crypto failed")
         await q.message.reply_text("Не удалось обновить цены/курс.")
 
-# ==== Snapshot ====
+# ==== Snapshot (All stats) ====
 async def handle_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         (users, juiced), mkt, btc_chg, eth_chg = await asyncio.gather(
@@ -309,11 +322,11 @@ async def handle_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ETH: {fmt_usd(eth)} ({fmt_pct(eth_chg) if eth_chg is not None else '—'} за 24ч)\n"
             f"USD/RUB: {fmt_rub(usd_rub)}"
         )
-        txt = f"Snapshot\n\nGiga\n{giga}\n\nCrypto\n{crypto}"
+        txt = f"All stats\n\nGiga\n{giga}\n\nCrypto\n{crypto}"
         await update.effective_message.reply_text(txt, reply_markup=KB_SNAPSHOT())
     except Exception:
         log.exception("snapshot failed")
-        await update.effective_message.reply_text("Не удалось собрать snapshot.")
+        await update.effective_message.reply_text("Не удалось собрать статистику.")
 
 async def on_refresh_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -405,36 +418,48 @@ async def send_chart_for_pref(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     ])
     await context.bot.send_photo(chat_id=chat_id, photo=io.BytesIO(png), caption=cap)
 
-# ==== Gas ETH ====
-async def fetch_eth_mainnet_gas() -> Optional[Dict[str, float]]:
-    url = "https://www.etherchain.org/api/gasPriceOracle"
-    async with httpx.AsyncClient(timeout=12, headers=CRYPTO_HEADERS) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            return None
-        d = r.json() or {}
-    out = {}
-    for k in ("currentBaseFee", "safeLow", "standard", "fast", "fastest", "priorityFee", "recommendedBaseFee"):
-        v = d.get(k)
-        if isinstance(v, (int, float)): out[k] = float(v)
-    return out or None
-
-async def fetch_rpc_gas_gwei(rpc_url: str) -> Optional[float]:
-    if not rpc_url:
-        return None
-    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_gasPrice", "params": []}
-    async with httpx.AsyncClient(timeout=12, headers={"Content-Type": "application/json"}) as client:
-        r = await client.post(rpc_url, json=payload)
-        if r.status_code != 200:
-            return None
-        data = r.json()
+# ==== Gas ETH — через RPC (без ключей) ====
+async def rpc_fee_suggestions_gwei(rpc_url: str) -> Optional[Dict[str, float]]:
+    # Пытаемся взять feeHistory (5 блоков, перцентили 10/50/90)
     try:
-        wei_hex = data.get("result")
-        wei = int(wei_hex, 16)
-        gwei = wei / 1e9
-        return gwei
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_feeHistory",
+                   "params": ["0x5", "latest", [10, 50, 90]]}
+        async with httpx.AsyncClient(timeout=12, headers={"Content-Type": "application/json"}) as client:
+            r = await client.post(rpc_url, json=payload)
+            if r.status_code != 200:
+                raise RuntimeError("feeHistory http error")
+            data = r.json().get("result") or {}
+        base_arr = data.get("baseFeePerGas") or []
+        reward_arr = data.get("reward") or []
+        if len(base_arr) < 2 or not reward_arr:
+            raise RuntimeError("feeHistory incomplete")
+
+        def h2g(x): return int(x, 16) / 1e9
+        base_last = h2g(base_arr[-1])
+        # усредним перцентили по блокам
+        tips10 = [h2g(b[0]) for b in reward_arr if b and len(b) >= 1]
+        tips50 = [h2g(b[1]) for b in reward_arr if b and len(b) >= 2]
+        tips90 = [h2g(b[2]) for b in reward_arr if b and len(b) >= 3]
+        def avg(a): return sum(a) / len(a) if a else 0.0
+        low = base_last + avg(tips10)
+        std = base_last + avg(tips50)
+        fast = base_last + avg(tips90)
+        return {"base": max(base_last, 0.0), "low": max(low, 0.0), "std": max(std, 0.0), "fast": max(fast, 0.0)}
     except Exception:
-        return None
+        # fallback: eth_gasPrice
+        try:
+            payload = {"jsonrpc": "2.0", "id": 2, "method": "eth_gasPrice", "params": []}
+            async with httpx.AsyncClient(timeout=8, headers={"Content-Type": "application/json"}) as client:
+                r = await client.post(rpc_url, json=payload)
+                if r.status_code != 200:
+                    return None
+                gp_hex = (r.json() or {}).get("result")
+            gwei = int(gp_hex, 16) / 1e9 if gp_hex else 0.0
+            if gwei <= 0:
+                return None
+            return {"base": gwei, "low": gwei * 0.9, "std": gwei, "fast": gwei * 1.1}
+        except Exception:
+            return None
 
 def estimate_fee_usd(gwei: Optional[float], gas_units: int, eth_usd: Optional[float]) -> Optional[float]:
     if gwei is None or eth_usd is None:
@@ -444,38 +469,38 @@ def estimate_fee_usd(gwei: Optional[float], gas_units: int, eth_usd: Optional[fl
 
 async def handle_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        gas_mainnet, gas_abs_gwei, mkt = await asyncio.gather(
-            fetch_eth_mainnet_gas(),
-            fetch_rpc_gas_gwei(ABSTRACT_RPC) if ABSTRACT_RPC else asyncio.sleep(0, result=None),
-            get_market_cached(force=False),
-        )
-        eth_usd = mkt.get("ETH") if isinstance(mkt, dict) else None
+        # ETH mainnet через RPC (publicnode → ankr)
+        main_sug = await rpc_fee_suggestions_gwei(ETH_RPC1) or await rpc_fee_suggestions_gwei(ETH_RPC2)
+        # Abstract по RPC
+        abs_sug = await rpc_fee_suggestions_gwei(ABSTRACT_RPC) if ABSTRACT_RPC else None
+        mkt = await get_market_cached(force=False)
+        eth_usd = mkt.get("ETH")
 
-        if gas_mainnet:
-            base = gas_mainnet.get("currentBaseFee") or gas_mainnet.get("recommendedBaseFee")
-            low = gas_mainnet.get("safeLow"); std = gas_mainnet.get("standard"); fast = gas_mainnet.get("fast")
+        if main_sug:
+            base = main_sug["base"]; low = main_sug["low"]; std = main_sug["std"]; fast = main_sug["fast"]
             tx_usd = estimate_fee_usd(std, 21_000, eth_usd)
             swap_usd = estimate_fee_usd(std, 100_000, eth_usd)
             main_text = (
                 "ETH Mainnet\n"
                 f"Base: {base:.1f} gwei\n"
                 f"Low | Std | Fast: {low:.1f} | {std:.1f} | {fast:.1f} gwei\n"
-                f"Оценка (Std): transfer ≈ {fmt_usd(tx_usd)}, swap ≈ {fmt_usd(swap_usd)}"
+                f"Оценка (Std): transfer ≈ {fmt_usd_short(tx_usd)}, swap ≈ {fmt_usd_short(swap_usd)}"
             )
         else:
-            main_text = "ETH Mainnet\n— не удалось получить газ с Etherchain"
+            main_text = "ETH Mainnet\n— не удалось получить газ по RPC"
 
         if ABSTRACT_RPC:
-            if gas_abs_gwei is not None:
-                a_tx_usd = estimate_fee_usd(gas_abs_gwei, 21_000, eth_usd)
-                a_swap_usd = estimate_fee_usd(gas_abs_gwei, 100_000, eth_usd)
+            if abs_sug:
+                a_std = abs_sug["std"]
+                a_tx_usd = estimate_fee_usd(a_std, 21_000, eth_usd)
+                a_swap_usd = estimate_fee_usd(a_std, 100_000, eth_usd)
                 abs_text = (
                     "Abstract\n"
-                    f"Gas price: {gas_abs_gwei:.1f} gwei\n"
-                    f"Оценка: transfer ≈ {fmt_usd(a_tx_usd)}, swap ≈ {fmt_usd(a_swap_usd)}"
+                    f"Gas price: {a_std:.1f} gwei (Std)\n"
+                    f"Оценка: transfer ≈ {fmt_usd_short(a_tx_usd)}, swap ≈ {fmt_usd_short(a_swap_usd)}"
                 )
             else:
-                abs_text = "Abstract\n— не удалось получить газ с RPC (проверьте ABSTRACT_RPC)"
+                abs_text = "Abstract\n— не удалось получить газ по RPC (проверьте доступность)"
         else:
             abs_text = "Abstract\n— не настроено (добавьте ABSTRACT_RPC)"
 
@@ -491,9 +516,86 @@ async def on_refresh_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     await handle_gas(update, context)
 
-# ==== Charts handlers (меню выбора) ====
+# ==== /convert (добавлен bnb) ====
+UNITS = {"usd", "rub", "btc", "eth", "bnb", "$", "₽"}
+
+def norm_unit(u: str) -> Optional[str]:
+    u = u.lower()
+    if u in ("$", "usd"): return "usd"
+    if u in ("rub", "₽", "rubles", "rur"): return "rub"
+    if u in ("btc", "Ƀ"): return "btc"
+    if u in ("eth",): return "eth"
+    if u in ("bnb",): return "bnb"
+    return None
+
+async def handle_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.effective_message.text or "").strip()
+    m = re.match(r"^[!/](?:convert|conv)\s+([0-9]+(?:[.,][0-9]+)?)\s+([a-zA-Z₽$]+)\s+([a-zA-Z₽$]+)", text)
+    if not m:
+        await update.effective_message.reply_text("Использование: /convert 0.05 btc rub")
+        return
+    amount = float(m.group(1).replace(",", "."))
+    src = norm_unit(m.group(2)); dst = norm_unit(m.group(3))
+    if not src or not dst or src == dst:
+        await update.effective_message.reply_text("Поддержка: usd, rub, btc, eth, bnb. Пример: /convert 100 usd rub")
+        return
+
+    mkt = await get_market_cached(force=True)
+    btc, eth, bnb, usd_rub = mkt.get("BTC"), mkt.get("ETH"), mkt.get("BNB"), mkt.get("USD_RUB")
+    if any(v is None for v in (btc, eth, usd_rub)) or (src == "bnb" or dst == "bnb") and (bnb is None):
+        await update.effective_message.reply_text("Нет котировок для конвертации, попробуйте ещё раз.")
+        return
+
+    # src -> USD
+    usd = None
+    if src == "usd": usd = amount
+    elif src == "rub": usd = amount / usd_rub
+    elif src == "btc": usd = amount * btc
+    elif src == "eth": usd = amount * eth
+    elif src == "bnb": usd = amount * bnb
+
+    # USD -> dst
+    out = None
+    if dst == "usd": out = usd
+    elif dst == "rub": out = usd * usd_rub
+    elif dst == "btc": out = usd / btc
+    elif dst == "eth": out = usd / eth
+    elif dst == "bnb": out = usd / bnb
+
+    if out is None:
+        await update.effective_message.reply_text("Не удалось конвертировать.")
+        return
+
+    def fmt_unit(u: str, v: float) -> str:
+        if u == "usd": return fmt_usd(v)
+        if u == "rub": return fmt_rub(v)
+        if u == "btc": return f"{v:.8f} BTC"
+        if u == "eth": return f"{v:.8f} ETH"
+        if u == "bnb": return f"{v:.8f} BNB"
+        return str(v)
+
+    await update.effective_message.reply_text(
+        f"{amount:g} {src.upper()} = {fmt_unit(dst, out)}",
+        disable_web_page_preview=True
+    )
+
+# ==== Commands (список скрытых команд) ====
+async def handle_cmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "Commands:\n"
+        "• /convert 0.05 btc rub — конвертация (usd/rub/btc/eth/bnb)\n"
+        "• /charts — открыть меню графиков (BTC/ETH, 24h/7d/30d)\n"
+        "• /gas — газ ETH mainnet + Abstract\n"
+        "• /users — Giga users/juiced\n"
+        "• /crypto — цены BTC/ETH + USD/RUB\n"
+        "• /chatid — ID текущего чата"
+    )
+    await update.effective_message.reply_text(txt, reply_markup=KB_COMMANDS(), disable_web_page_preview=True)
+
+# ==== Charts меню ====
+CHART_PREFS: Dict[int, Dict[str, str]] = {}  # chat_id -> {"coin":"BTC","tf":"7d"}
+
 async def handle_charts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Показать меню выбора и сразу отправить график по текущему выбору
     q_or_m = update.callback_query
     chat_id = update.effective_chat.id
     pref = CHART_PREFS.get(chat_id) or {"coin": "BTC", "tf": "7d"}
@@ -558,7 +660,7 @@ async def charts_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     await send_chart_for_pref(update.effective_chat.id, context)
 
-# ==== start/menu/chatid / snapshot ====
+# ==== start/menu/chatid ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Выберите действие:", reply_markup=KB_START)
 
@@ -588,6 +690,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_gas(update, context)
     elif data == "menu_chatid":
         await chatid(update, context)
+    elif data == "menu_cmds":
+        await handle_cmds(update, context)
 
 async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -613,16 +717,19 @@ def main():
     app.add_handler(CommandHandler("users", handle_users))
     app.add_handler(CommandHandler("crypto", handle_crypto))
     app.add_handler(CommandHandler("snapshot", handle_snapshot))
+    app.add_handler(CommandHandler("convert", handle_convert))
+    app.add_handler(CommandHandler("conv", handle_convert))
     app.add_handler(CommandHandler("charts", handle_charts_menu))
     app.add_handler(CommandHandler("gas", handle_gas))
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("cmds", handle_cmds))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh_users$"))
     app.add_handler(CallbackQueryHandler(on_refresh_crypto, pattern=r"^refresh_crypto$"))
     app.add_handler(CallbackQueryHandler(on_refresh_snapshot, pattern=r"^refresh_snapshot$"))
     app.add_handler(CallbackQueryHandler(on_refresh_gas, pattern=r"^refresh_gas$"))
-    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|chatid)$"))
+    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|chatid|cmds)$"))
     app.add_handler(CallbackQueryHandler(charts_set_coin, pattern=r"^charts_coin_(BTC|ETH)$"))
     app.add_handler(CallbackQueryHandler(charts_set_tf, pattern=r"^charts_tf_(24h|7d|30d)$"))
     app.add_handler(CallbackQueryHandler(charts_refresh, pattern=r"^charts_refresh$"))
@@ -634,6 +741,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!crypto\b", re.IGNORECASE)), handle_crypto))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts_menu))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!gas\b", re.IGNORECASE)), handle_gas))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!(?:convert|conv)\b", re.IGNORECASE)), handle_convert))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!cmds\b", re.IGNORECASE)), handle_cmds))
 
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     log.info("Starting webhook on port %s, path '/%s', webhook_url=%s", PORT, WEBHOOK_PATH, webhook_url)
@@ -645,28 +754,6 @@ def main():
         webhook_url=webhook_url,
         drop_pending_updates=True,
     )
-
-# Snapshot reused above
-async def handle_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        (users, juiced), mkt, btc_chg, eth_chg = await asyncio.gather(
-            get_stats_cached(force=True),
-            get_market_cached(force=True),
-            fetch_24h_change("BTCUSDT"),
-            fetch_24h_change("ETHUSDT"),
-        )
-        btc, eth, usd_rub = mkt.get("BTC"), mkt.get("ETH"), mkt.get("USD_RUB")
-        giga = format_users_message(users, juiced)
-        crypto = (
-            f"BTC: {fmt_usd(btc)} ({fmt_pct(btc_chg) if btc_chg is not None else '—'} за 24ч)\n"
-            f"ETH: {fmt_usd(eth)} ({fmt_pct(eth_chg) if eth_chg is not None else '—'} за 24ч)\n"
-            f"USD/RUB: {fmt_rub(usd_rub)}"
-        )
-        txt = f"Snapshot\n\nGiga\n{giga}\n\nCrypto\n{crypto}"
-        await update.effective_message.reply_text(txt, reply_markup=KB_SNAPSHOT())
-    except Exception:
-        log.exception("snapshot failed")
-        await update.effective_message.reply_text("Не удалось собрать snapshot.")
 
 if __name__ == "__main__":
     main()
