@@ -14,7 +14,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 
-# Load env
+# Load env (Render прокинет переменные окружения)
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -27,15 +27,19 @@ PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook").strip()
 BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
+# Abstract RPC (по умолчанию ваш mainnet endpoint)
+ABSTRACT_RPC = os.getenv("ABSTRACT_RPC", "https://api.mainnet.abs.xyz").strip()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
 # ==== Keyboards ====
 KB_START = InlineKeyboardMarkup([
-    [InlineKeyboardButton("All stats", callback_data="menu_snapshot")],
+    [InlineKeyboardButton("Snapshot", callback_data="menu_snapshot")],
     [InlineKeyboardButton("Giga users", callback_data="menu_users")],
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
     [InlineKeyboardButton("Crypto charts", callback_data="menu_charts")],
+    [InlineKeyboardButton("Gas ETH", callback_data="menu_gas")],
     [InlineKeyboardButton("ChatID", callback_data="menu_chatid")],
 ])
 
@@ -57,10 +61,22 @@ def KB_SNAPSHOT():
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
     ])
 
-def KB_CHARTS():
+def KB_GAS():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_charts")],
+        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_gas")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+def KB_CHARTS_SELECT(coin: str, tf: str):
+    def mark(x, cur): return f"{x} ✓" if x == cur else x
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(mark("BTC", coin), callback_data="charts_coin_BTC"),
+         InlineKeyboardButton(mark("ETH", coin), callback_data="charts_coin_ETH")],
+        [InlineKeyboardButton(mark("24h", tf), callback_data="charts_tf_24h"),
+         InlineKeyboardButton(mark("7d", tf),  callback_data="charts_tf_7d"),
+         InlineKeyboardButton(mark("30d", tf), callback_data="charts_tf_30d")],
+        [InlineKeyboardButton("⟳ Обновить", callback_data="charts_refresh"),
+         InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
     ])
 
 def KB_BACK():
@@ -236,7 +252,7 @@ async def get_market_cached(force: bool = False) -> Dict[str, Optional[float]]:
     _market_cache_ts = time.monotonic()
     return _market_cache
 
-# ==== /crypto (с 24h change) ====
+# ==== /crypto (+24h change) ====
 async def handle_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         mkt, btc_chg, eth_chg = await asyncio.gather(
@@ -277,7 +293,7 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh crypto failed")
         await q.message.reply_text("Не удалось обновить цены/курс.")
 
-# ==== Snapshot (всё в одном) ====
+# ==== Snapshot ====
 async def handle_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         (users, juiced), mkt, btc_chg, eth_chg = await asyncio.gather(
@@ -305,9 +321,9 @@ async def on_refresh_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception: pass
     await handle_snapshot(update, context)
 
-# ==== Charts (из прошлой версии) ====
-# Быстрый вариант: показывать 2 PNG по кнопке Crypto charts (BTC/ETH, 7d)
-# Используем Binance klines + QuickChart
+# ==== Charts — выбор монеты/таймфрейма, 1 PNG ====
+CHART_PREFS: Dict[int, Dict[str, str]] = {}  # chat_id -> {"coin":"BTC","tf":"7d"}
+
 async def fetch_binance_series(symbol: str, interval: str, limit: int) -> List[Tuple[int, float]]:
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
@@ -323,6 +339,11 @@ async def fetch_binance_series(symbol: str, interval: str, limit: int) -> List[T
         except Exception:
             continue
     return out
+
+def tf_to_params(tf: str) -> Tuple[str, int]:
+    if tf == "24h": return ("15m", 96)
+    if tf == "30d": return ("4h", 180)   # ~30 дней
+    return ("1h", 168)                    # 7d дефолт
 
 def nearest_price(series: List[Tuple[int, float]], target_ms: int) -> Optional[float]:
     if not series: return None
@@ -364,98 +385,180 @@ async def render_chart_png(config: Dict, width: int = 800, height: int = 400) ->
         r.raise_for_status()
         return r.content
 
-async def send_coin_chart(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
-                          symbol_pair: str, symbol_short: str, color: str) -> None:
-    series = await fetch_binance_series(symbol_pair, "1h", 168)  # 7d
+async def send_chart_for_pref(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    pref = CHART_PREFS.get(chat_id, {"coin": "BTC", "tf": "7d"})
+    coin = pref["coin"]; tf = pref["tf"]
+    symbol_pair = "BTCUSDT" if coin == "BTC" else "ETHUSDT"
+    interval, limit = tf_to_params(tf)
+    series = await fetch_binance_series(symbol_pair, interval, limit)
     if not series:
-        await context.bot.send_message(chat_id=chat_id, text=f"{symbol_short}: не удалось получить данные.")
+        await context.bot.send_message(chat_id=chat_id, text=f"{coin}: не удалось получить данные.")
         return
-    cfg = make_chart_config(series, f"{symbol_short} 7d", color)
+    cfg = make_chart_config(series, f"{coin} {tf}", "#f2a900" if coin == "BTC" else "#3c3c3d")
     png = await render_chart_png(cfg)
     chg = calc_changes_from_series(series)
     cap = "\n".join([
-        f"{symbol_short}: {fmt_usd(chg.get('now'))}",
+        f"{coin}: {fmt_usd(chg.get('now'))}",
         f"1ч: {fmt_usd_delta(chg.get('d1h'))} ({fmt_pct(chg.get('p1h'))})",
         f"6ч: {fmt_usd_delta(chg.get('d6h'))} ({fmt_pct(chg.get('p6h'))})",
         f"24ч: {fmt_usd_delta(chg.get('d24h'))} ({fmt_pct(chg.get('p24h'))})",
     ])
     await context.bot.send_photo(chat_id=chat_id, photo=io.BytesIO(png), caption=cap)
 
-async def send_charts_pack(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE):
-    await send_coin_chart(chat_id, context, "BTCUSDT", "BTC", "#f2a900")
-    await send_coin_chart(chat_id, context, "ETHUSDT", "ETH", "#3c3c3d")
-    await context.bot.send_message(chat_id=chat_id, text="Crypto charts (7d)", reply_markup=KB_CHARTS())
+# ==== Gas ETH ====
+async def fetch_eth_mainnet_gas() -> Optional[Dict[str, float]]:
+    url = "https://www.etherchain.org/api/gasPriceOracle"
+    async with httpx.AsyncClient(timeout=12, headers=CRYPTO_HEADERS) as client:
+        r = await client.get(url)
+        if r.status_code != 200:
+            return None
+        d = r.json() or {}
+    out = {}
+    for k in ("currentBaseFee", "safeLow", "standard", "fast", "fastest", "priorityFee", "recommendedBaseFee"):
+        v = d.get(k)
+        if isinstance(v, (int, float)): out[k] = float(v)
+    return out or None
 
-async def handle_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_charts_pack(update.effective_chat.id, context)
+async def fetch_rpc_gas_gwei(rpc_url: str) -> Optional[float]:
+    if not rpc_url:
+        return None
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_gasPrice", "params": []}
+    async with httpx.AsyncClient(timeout=12, headers={"Content-Type": "application/json"}) as client:
+        r = await client.post(rpc_url, json=payload)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    try:
+        wei_hex = data.get("result")
+        wei = int(wei_hex, 16)
+        gwei = wei / 1e9
+        return gwei
+    except Exception:
+        return None
 
-async def on_refresh_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def estimate_fee_usd(gwei: Optional[float], gas_units: int, eth_usd: Optional[float]) -> Optional[float]:
+    if gwei is None or eth_usd is None:
+        return None
+    eth_cost = (gwei * 1e-9) * gas_units
+    return eth_cost * eth_usd
+
+async def handle_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        gas_mainnet, gas_abs_gwei, mkt = await asyncio.gather(
+            fetch_eth_mainnet_gas(),
+            fetch_rpc_gas_gwei(ABSTRACT_RPC) if ABSTRACT_RPC else asyncio.sleep(0, result=None),
+            get_market_cached(force=False),
+        )
+        eth_usd = mkt.get("ETH") if isinstance(mkt, dict) else None
+
+        if gas_mainnet:
+            base = gas_mainnet.get("currentBaseFee") or gas_mainnet.get("recommendedBaseFee")
+            low = gas_mainnet.get("safeLow"); std = gas_mainnet.get("standard"); fast = gas_mainnet.get("fast")
+            tx_usd = estimate_fee_usd(std, 21_000, eth_usd)
+            swap_usd = estimate_fee_usd(std, 100_000, eth_usd)
+            main_text = (
+                "ETH Mainnet\n"
+                f"Base: {base:.1f} gwei\n"
+                f"Low | Std | Fast: {low:.1f} | {std:.1f} | {fast:.1f} gwei\n"
+                f"Оценка (Std): transfer ≈ {fmt_usd(tx_usd)}, swap ≈ {fmt_usd(swap_usd)}"
+            )
+        else:
+            main_text = "ETH Mainnet\n— не удалось получить газ с Etherchain"
+
+        if ABSTRACT_RPC:
+            if gas_abs_gwei is not None:
+                a_tx_usd = estimate_fee_usd(gas_abs_gwei, 21_000, eth_usd)
+                a_swap_usd = estimate_fee_usd(gas_abs_gwei, 100_000, eth_usd)
+                abs_text = (
+                    "Abstract\n"
+                    f"Gas price: {gas_abs_gwei:.1f} gwei\n"
+                    f"Оценка: transfer ≈ {fmt_usd(a_tx_usd)}, swap ≈ {fmt_usd(a_swap_usd)}"
+                )
+            else:
+                abs_text = "Abstract\n— не удалось получить газ с RPC (проверьте ABSTRACT_RPC)"
+        else:
+            abs_text = "Abstract\n— не настроено (добавьте ABSTRACT_RPC)"
+
+        text = f"{main_text}\n\n{abs_text}"
+        await update.effective_message.reply_text(text, reply_markup=KB_GAS())
+    except Exception:
+        log.exception("/gas failed")
+        await update.effective_message.reply_text("Не удалось получить газ ETH/Abstract.")
+
+async def on_refresh_gas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    try: await q.answer("Обновляю графики…", cache_time=0)
+    try: await q.answer("Обновляю газ…", cache_time=0)
     except Exception: pass
-    await send_charts_pack(update.effective_chat.id, context)
+    await handle_gas(update, context)
 
-# ==== /convert ====
-UNITS = {"usd", "rub", "btc", "eth", "$", "₽"}
+# ==== Charts handlers (меню выбора) ====
+async def handle_charts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Показать меню выбора и сразу отправить график по текущему выбору
+    q_or_m = update.callback_query
+    chat_id = update.effective_chat.id
+    pref = CHART_PREFS.get(chat_id) or {"coin": "BTC", "tf": "7d"}
+    CHART_PREFS[chat_id] = pref
+    try:
+        if q_or_m:
+            await q_or_m.answer()
+            await q_or_m.edit_message_text(
+                f"Crypto charts — {pref['coin']} — {pref['tf']}",
+                reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf'])
+            )
+        else:
+            await update.effective_message.reply_text(
+                f"Crypto charts — {pref['coin']} — {pref['tf']}",
+                reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf'])
+            )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Crypto charts — {pref['coin']} — {pref['tf']}",
+            reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf'])
+        )
+    await send_chart_for_pref(chat_id, context)
 
-def norm_unit(u: str) -> Optional[str]:
-    u = u.lower()
-    if u in ("$", "usd"): return "usd"
-    if u in ("rub", "₽", "rubles", "rur"): return "rub"
-    if u in ("btc", "Ƀ"): return "btc"
-    if u in ("eth",): return "eth"
-    return None
+async def charts_set_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try: await q.answer()
+    except Exception: pass
+    chat_id = update.effective_chat.id
+    coin = "BTC" if q.data.endswith("BTC") else "ETH"
+    pref = CHART_PREFS.get(chat_id) or {"coin": "BTC", "tf": "7d"}
+    pref["coin"] = coin; CHART_PREFS[chat_id] = pref
+    try:
+        await q.edit_message_text(f"Crypto charts — {pref['coin']} — {pref['tf']}",
+                                  reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf']))
+    except Exception:
+        await context.bot.send_message(chat_id=chat_id,
+                                       text=f"Crypto charts — {pref['coin']} — {pref['tf']}",
+                                       reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf']))
+    await send_chart_for_pref(chat_id, context)
 
-async def handle_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.effective_message.text or "").strip()
-    m = re.match(r"^[!/](?:convert|conv)\s+([0-9]+(?:[.,][0-9]+)?)\s+([a-zA-Z₽$]+)\s+([a-zA-Z₽$]+)", text)
-    if not m:
-        await update.effective_message.reply_text("Использование: /convert 0.05 btc rub")
-        return
-    amount = float(m.group(1).replace(",", "."))
-    src = norm_unit(m.group(2)); dst = norm_unit(m.group(3))
-    if not src or not dst or src == dst:
-        await update.effective_message.reply_text("Поддержка: usd, rub, btc, eth. Пример: /convert 100 usd rub")
-        return
+async def charts_set_tf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try: await q.answer()
+    except Exception: pass
+    chat_id = update.effective_chat.id
+    tf = "24h" if "24h" in q.data else ("30d" if "30d" in q.data else "7d")
+    pref = CHART_PREFS.get(chat_id) or {"coin": "BTC", "tf": "7d"}
+    pref["tf"] = tf; CHART_PREFS[chat_id] = pref
+    try:
+        await q.edit_message_text(f"Crypto charts — {pref['coin']} — {pref['tf']}",
+                                  reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf']))
+    except Exception:
+        await context.bot.send_message(chat_id=chat_id,
+                                       text=f"Crypto charts — {pref['coin']} — {pref['tf']}",
+                                       reply_markup=KB_CHARTS_SELECT(pref['coin'], pref['tf']))
+    await send_chart_for_pref(chat_id, context)
 
-    mkt = await get_market_cached(force=True)
-    btc, eth, usd_rub = mkt.get("BTC"), mkt.get("ETH"), mkt.get("USD_RUB")
-    if any(v is None for v in (btc, eth, usd_rub)):
-        await update.effective_message.reply_text("Нет котировок для конвертации, попробуйте ещё раз.")
-        return
+async def charts_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try: await q.answer("Обновляю график…", cache_time=0)
+    except Exception: pass
+    await send_chart_for_pref(update.effective_chat.id, context)
 
-    # src -> USD
-    usd = None
-    if src == "usd": usd = amount
-    elif src == "rub": usd = amount / usd_rub
-    elif src == "btc": usd = amount * btc
-    elif src == "eth": usd = amount * eth
-
-    # USD -> dst
-    out = None
-    if dst == "usd": out = usd
-    elif dst == "rub": out = usd * usd_rub
-    elif dst == "btc": out = usd / btc
-    elif dst == "eth": out = usd / eth
-
-    if out is None:
-        await update.effective_message.reply_text("Не удалось конвертировать.")
-        return
-
-    # Красиво отформатируем
-    def fmt_unit(u: str, v: float) -> str:
-        if u == "usd": return fmt_usd(v)
-        if u == "rub": return fmt_rub(v)
-        if u == "btc": return f"{v:.8f} BTC"
-        if u == "eth": return f"{v:.8f} ETH"
-        return str(v)
-
-    await update.effective_message.reply_text(
-        f"{amount:g} {src.upper()} = {fmt_unit(dst, out)}",
-        disable_web_page_preview=True
-    )
-
-# ==== start/menu/chatid ====
+# ==== start/menu/chatid / snapshot ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Выберите действие:", reply_markup=KB_START)
 
@@ -473,16 +576,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     try: await q.answer()
     except Exception: pass
-    chat_id = update.effective_chat.id
-
     if data == "menu_snapshot":
         await handle_snapshot(update, context)
     elif data == "menu_users":
-        await send_users(chat_id, context.bot)
+        await send_users(update.effective_chat.id, context.bot)
     elif data == "menu_crypto":
         await handle_crypto(update, context)
     elif data == "menu_charts":
-        await handle_charts(update, context)
+        await handle_charts_menu(update, context)
+    elif data == "menu_gas":
+        await handle_gas(update, context)
     elif data == "menu_chatid":
         await chatid(update, context)
 
@@ -510,25 +613,27 @@ def main():
     app.add_handler(CommandHandler("users", handle_users))
     app.add_handler(CommandHandler("crypto", handle_crypto))
     app.add_handler(CommandHandler("snapshot", handle_snapshot))
-    app.add_handler(CommandHandler("convert", handle_convert))
-    app.add_handler(CommandHandler("conv", handle_convert))
-    app.add_handler(CommandHandler("charts", handle_charts))
+    app.add_handler(CommandHandler("charts", handle_charts_menu))
+    app.add_handler(CommandHandler("gas", handle_gas))
     app.add_handler(CommandHandler("chatid", chatid))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh_users$"))
     app.add_handler(CallbackQueryHandler(on_refresh_crypto, pattern=r"^refresh_crypto$"))
-    app.add_handler(CallbackQueryHandler(on_refresh_charts, pattern=r"^refresh_charts$"))
     app.add_handler(CallbackQueryHandler(on_refresh_snapshot, pattern=r"^refresh_snapshot$"))
-    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|chatid)$"))
+    app.add_handler(CallbackQueryHandler(on_refresh_gas, pattern=r"^refresh_gas$"))
+    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|chatid)$"))
+    app.add_handler(CallbackQueryHandler(charts_set_coin, pattern=r"^charts_coin_(BTC|ETH)$"))
+    app.add_handler(CallbackQueryHandler(charts_set_tf, pattern=r"^charts_tf_(24h|7d|30d)$"))
+    app.add_handler(CallbackQueryHandler(charts_refresh, pattern=r"^charts_refresh$"))
     app.add_handler(CallbackQueryHandler(on_back_menu, pattern=r"^back_menu$"))
     app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh$"))  # legacy
 
     # Aliases
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!users\b", re.IGNORECASE)), handle_users))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!crypto\b", re.IGNORECASE)), handle_crypto))
-    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts))
-    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!(?:convert|conv)\b", re.IGNORECASE)), handle_convert))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts_menu))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!gas\b", re.IGNORECASE)), handle_gas))
 
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     log.info("Starting webhook on port %s, path '/%s', webhook_url=%s", PORT, WEBHOOK_PATH, webhook_url)
@@ -541,7 +646,7 @@ def main():
         drop_pending_updates=True,
     )
 
-# Snapshot depends on functions above
+# Snapshot reused above
 async def handle_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         (users, juiced), mkt, btc_chg, eth_chg = await asyncio.gather(
