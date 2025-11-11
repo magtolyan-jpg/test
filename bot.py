@@ -6,6 +6,7 @@ import logging
 import asyncio
 from pathlib import Path
 from typing import Tuple, Optional, Dict, List
+from datetime import datetime, timedelta
 
 import httpx
 from dotenv import load_dotenv
@@ -42,6 +43,7 @@ KB_START = InlineKeyboardMarkup([
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
     [InlineKeyboardButton("Crypto charts", callback_data="menu_charts")],
     [InlineKeyboardButton("Gas ETH", callback_data="menu_gas")],
+    [InlineKeyboardButton("Risk (RU)", callback_data="menu_risk")],
     [InlineKeyboardButton("ChatID", callback_data="menu_chatid")],
     [InlineKeyboardButton("Commands", callback_data="menu_cmds")],
 ])
@@ -79,6 +81,12 @@ def KB_CHARTS_SELECT(coin: str, tf: str):
 def KB_GAS():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_gas")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+def KB_RISK():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⟳ Обновить", callback_data="refresh_risk")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
     ])
 
@@ -584,6 +592,7 @@ async def handle_cmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "Commands:\n"
         "• /convert 0.05 btc rub — конвертация (usd/rub/btc/eth/bnb)\n"
+        "• /risk — country risk (RU) с рекомендацией\n"
         "• /charts — открыть меню графиков (BTC/ETH, 24h/7d/30d)\n"
         "• /gas — газ ETH mainnet + Abstract\n"
         "• /users — Giga users/juiced\n"
@@ -660,6 +669,116 @@ async def charts_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     await send_chart_for_pref(update.effective_chat.id, context)
 
+# ==== RISK (RU) ====
+async def fetch_wb_cpi_yoy_ru() -> Optional[float]:
+    # World Bank CPI YoY (последнее доступное)
+    url = "https://api.worldbank.org/v2/country/RUS/indicator/FP.CPI.TOTL.ZG"
+    params = {"format": "json", "per_page": "60"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+        rows = data[1] if isinstance(data, list) and len(data) > 1 else []
+        for row in rows:
+            val = row.get("value")
+            if isinstance(val, (int, float)):
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+async def fetch_usd_rub_ts_30d() -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    # Возвращает (last, first, pct_change_30d)
+    try:
+        end = datetime.utcnow().date()
+        start = end - timedelta(days=35)
+        url = "https://api.exchangerate.host/timeseries"
+        params = {
+            "base": "USD",
+            "symbols": "RUB",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            js = r.json()
+        rates = js.get("rates", {})
+        if not isinstance(rates, dict) or not rates:
+            return None, None, None
+        days_sorted = sorted(d for d in rates.keys() if "RUB" in rates[d])
+        if not days_sorted:
+            return None, None, None
+        first_rate = float(rates[days_sorted[0]]["RUB"])
+        last_rate = float(rates[days_sorted[-1]]["RUB"])
+        pct = (last_rate / first_rate - 1.0) * 100.0 if first_rate > 0 else None
+        return last_rate, first_rate, pct
+    except Exception:
+        return None, None, None
+
+def make_risk_verdict(cpi_yoy: Optional[float], fx_30d_pct: Optional[float]) -> Tuple[str, str]:
+    # Простая эвристика
+    level = "низкий"
+    if fx_30d_pct is not None and fx_30d_pct >= 15:
+        level = "высокий"
+    elif fx_30d_pct is not None and fx_30d_pct >= 7:
+        level = "средний"
+    elif cpi_yoy is not None and cpi_yoy >= 10:
+        level = "средний"
+    # Рекомендация
+    if level == "низкий":
+        rec = "держите 3–6 мес. подушку в USD/EUR; рублёвые инструменты — короткие сроки; следите за MoM и курсом (+10–15%/30д — усилить защиту)"
+    elif level == "средний":
+        rec = "увеличьте долю FX/вне локального риска; избегайте длинных рублевых фиксов; запас наличного FX; 2–3 платёжных канала"
+    else:
+        rec = "сократите рублёвую экспозицию; ликвидный FX (частично наличный); избегайте валютных долгов; минимальные сроки, готовность к лимитам"
+    return level, rec
+
+def format_risk_ru(cpi_yoy: Optional[float], fx_last: Optional[float], fx_30d_pct: Optional[float]) -> str:
+    parts = []
+    parts.append("Country risk — Russia (RU)")
+    fx_line = f"USD/RUB (market): {fx_last:.2f}" if isinstance(fx_last, (int, float)) else "USD/RUB (market): —"
+    chg_line = f"30д: {fx_30d_pct:+.1f}%" if isinstance(fx_30d_pct, (int, float)) else "30д: —"
+    parts.append(f"FX\n- {fx_line}\n- {chg_line}")
+    cpi_line = f"{cpi_yoy:.1f}%" if isinstance(cpi_yoy, (int, float)) else "—"
+    parts.append(f"Цены\n- CPI YoY (WB): {cpi_line}")
+    level, rec = make_risk_verdict(cpi_yoy, fx_30d_pct)
+    parts.append(f"Вердикт\n- Риск: {level} ({rec})")
+    return "\n".join(parts)
+
+async def handle_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        (fx_last, fx_first, fx_30d_pct), cpi_yoy = await asyncio.gather(
+            fetch_usd_rub_ts_30d(),
+            fetch_wb_cpi_yoy_ru()
+        )
+        txt = format_risk_ru(cpi_yoy, fx_last, fx_30d_pct)
+        await update.effective_message.reply_text(txt, reply_markup=KB_RISK())
+    except Exception:
+        log.exception("/risk failed")
+        await update.effective_message.reply_text("Не удалось собрать данные для оценки риска.")
+
+async def on_refresh_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer("Обновляю…", cache_time=0)
+    except Exception:
+        pass
+    try:
+        (fx_last, fx_first, fx_30d_pct), cpi_yoy = await asyncio.gather(
+            fetch_usd_rub_ts_30d(),
+            fetch_wb_cpi_yoy_ru()
+        )
+        txt = format_risk_ru(cpi_yoy, fx_last, fx_30d_pct)
+        try:
+            await q.edit_message_text(txt, reply_markup=KB_RISK())
+        except Exception:
+            await q.message.reply_text(txt, reply_markup=KB_RISK())
+    except Exception:
+        log.exception("refresh risk failed")
+        await q.message.reply_text("Не удалось обновить данные риска.")
+
 # ==== start/menu/chatid ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Выберите действие:", reply_markup=KB_START)
@@ -688,6 +807,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_charts_menu(update, context)
     elif data == "menu_gas":
         await handle_gas(update, context)
+    elif data == "menu_risk":
+        await handle_risk(update, context)
     elif data == "menu_chatid":
         await chatid(update, context)
     elif data == "menu_cmds":
@@ -721,6 +842,7 @@ def main():
     app.add_handler(CommandHandler("conv", handle_convert))
     app.add_handler(CommandHandler("charts", handle_charts_menu))
     app.add_handler(CommandHandler("gas", handle_gas))
+    app.add_handler(CommandHandler("risk", handle_risk))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("cmds", handle_cmds))
 
@@ -729,7 +851,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_refresh_crypto, pattern=r"^refresh_crypto$"))
     app.add_handler(CallbackQueryHandler(on_refresh_snapshot, pattern=r"^refresh_snapshot$"))
     app.add_handler(CallbackQueryHandler(on_refresh_gas, pattern=r"^refresh_gas$"))
-    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|chatid|cmds)$"))
+    app.add_handler(CallbackQueryHandler(on_refresh_risk, pattern=r"^refresh_risk$"))
+    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu_(snapshot|users|crypto|charts|gas|risk|chatid|cmds)$"))
     app.add_handler(CallbackQueryHandler(charts_set_coin, pattern=r"^charts_coin_(BTC|ETH)$"))
     app.add_handler(CallbackQueryHandler(charts_set_tf, pattern=r"^charts_tf_(24h|7d|30d)$"))
     app.add_handler(CallbackQueryHandler(charts_refresh, pattern=r"^charts_refresh$"))
@@ -741,6 +864,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!crypto\b", re.IGNORECASE)), handle_crypto))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts_menu))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!gas\b", re.IGNORECASE)), handle_gas))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!risk\b", re.IGNORECASE)), handle_risk))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!(?:convert|conv)\b", re.IGNORECASE)), handle_convert))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!cmds\b", re.IGNORECASE)), handle_cmds))
 
