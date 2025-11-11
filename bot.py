@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import time
 import logging
 import asyncio
@@ -9,29 +10,28 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 
-# Загружаем .env из папки скрипта (Render прокидывает переменные окружения)
+# Load .env (Render прокинет переменные окружения, BASE_URL берётся из RENDER_EXTERNAL_URL)
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 API_URL = os.getenv("API_URL", "https://giganoob.com/data/html/users_snapshot.json").strip()
-CHANNEL = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()   # @username или -100...
-CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))            # кэш /users, сек
-CRYPTO_CACHE_TTL = int(os.getenv("CRYPTO_CACHE_TTL", "30"))  # кэш /crypto, сек
+CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))
+CRYPTO_CACHE_TTL = int(os.getenv("CRYPTO_CACHE_TTL", "30"))
 
-# Webhook/сервер для Render
-PORT = int(os.getenv("PORT", "10000"))  # Render прокидывает PORT
+# Webhook params
+PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "tg-webhook").strip()
 BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-# Кнопки старт-меню и экранов
+# Inline keyboards
 KB_START = InlineKeyboardMarkup([
     [InlineKeyboardButton("Giga users", callback_data="menu_users")],
     [InlineKeyboardButton("Crypto price", callback_data="menu_crypto")],
@@ -73,18 +73,7 @@ CRYPTO_HEADERS = {
     "Accept": "application/json",
 }
 
-# ========= Утилиты =========
-def parse_channel_id(val: str) -> str | int | None:
-    if not val:
-        return None
-    v = val.strip()
-    if v.startswith("-100") and v[4:].isdigit():
-        try:
-            return int(v)
-        except Exception:
-            return v
-    return v
-
+# Utils
 def fmt_int(n: Optional[int]) -> str:
     return f"{n:,}".replace(",", " ") if isinstance(n, int) else "—"
 
@@ -105,11 +94,16 @@ def fmt_pct(p: Optional[float]) -> str:
     sign = "+" if p >= 0 else ""
     return f"{sign}{p:.2f}%"
 
+def fmt_rub(n: Optional[float]) -> str:
+    if n is None:
+        return "—"
+    return f"{n:,.2f} ₽".replace(",", " ")
+
 def cache_busted(url: str) -> str:
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}t={int(time.time() * 1000)}"
 
-# ========= /users =========
+# ========== /users ==========
 _fetch_lock = asyncio.Lock()
 _cache_ts = 0.0
 _cache_data: Tuple[Optional[int], Optional[int]] = (None, None)
@@ -186,7 +180,7 @@ async def on_refresh_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh users failed")
         await q.message.reply_text("Не удалось обновить данные.")
 
-# ========= /crypto (BTC, ETH + USD/RUB) =========
+# ========== /crypto (BTC, ETH + USD/RUB) ==========
 _market_cache_ts = 0.0
 _market_cache: Dict[str, Optional[float]] = {"BTC": None, "ETH": None, "USD_RUB": None}
 
@@ -247,8 +241,7 @@ async def handle_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await get_market_cached(force=False)
         btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
-        text = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_usd(usd_rub)}".replace("$ ₽", " ₽")
-        # легкая замена только для формата, ниже есть отдельный fmt_rub, но здесь не критично
+        text = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_rub(usd_rub)}"
         await update.effective_message.reply_text(text, reply_markup=KB_CRYPTO())
     except Exception:
         log.exception("/crypto failed")
@@ -263,7 +256,7 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await get_market_cached(force=True)
         btc, eth, usd_rub = data.get("BTC"), data.get("ETH"), data.get("USD_RUB")
-        msg = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_usd(usd_rub)}".replace("$ ₽", " ₽")
+        msg = f"BTC: {fmt_usd(btc)}\nETH: {fmt_usd(eth)}\nUSD/RUB: {fmt_rub(usd_rub)}"
         try:
             await q.edit_message_text(msg, reply_markup=KB_CRYPTO())
         except Exception:
@@ -272,7 +265,7 @@ async def on_refresh_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("refresh crypto failed")
         await q.message.reply_text("Не удалось обновить цены/курс.")
 
-# ========= Crypto charts (PNG, 7d) =========
+# ========== Crypto charts (PNG, 7d, 1h/6h/24h deltas) ==========
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 async def fetch_cg_chart(coin_id: str, days: int = 7, interval: str = "hourly") -> List[Tuple[int, float]]:
@@ -283,15 +276,12 @@ async def fetch_cg_chart(coin_id: str, days: int = 7, interval: str = "hourly") 
         r.raise_for_status()
         data = r.json()
     prices = data.get("prices") or []
-    # список (ts_ms, price)
     return [(int(p[0]), float(p[1])) for p in prices if isinstance(p, list) and len(p) >= 2]
 
 def nearest_price(series: List[Tuple[int, float]], target_ms: int) -> Optional[float]:
     if not series:
         return None
-    # Находим ближайшую точку по времени
-    ts_list = [abs(ts - target_ms) for ts, _ in series]
-    idx = ts_list.index(min(ts_list))
+    idx = min(range(len(series)), key=lambda i: abs(series[i][0] - target_ms))
     return series[idx][1]
 
 def calc_changes(series: List[Tuple[int, float]]) -> Dict[str, Optional[float]]:
@@ -300,7 +290,6 @@ def calc_changes(series: List[Tuple[int, float]]) -> Dict[str, Optional[float]]:
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     now_price = series[-1][1]
     out = {"now": now_price}
-
     for label, hours in (("1h", 1), ("6h", 6), ("24h", 24)):
         prev = nearest_price(series, now_ms - hours * 3600 * 1000)
         if prev and prev > 0:
@@ -314,12 +303,11 @@ def calc_changes(series: List[Tuple[int, float]]) -> Dict[str, Optional[float]]:
     return out
 
 def make_chart_config(series: List[Tuple[int, float]], label: str, color: str) -> Dict:
-    # Сжимаем данные в массив чисел (ось X скрыта)
     data = [round(p, 2) for _, p in series]
     return {
         "type": "line",
         "data": {
-            "labels": ["" for _ in data],  # скрытые подписи
+            "labels": ["" for _ in data],
             "datasets": [{
                 "label": label,
                 "data": data,
@@ -332,34 +320,27 @@ def make_chart_config(series: List[Tuple[int, float]], label: str, color: str) -
         },
         "options": {
             "plugins": {"legend": {"display": False}},
-            "scales": {
-                "x": {"display": False},
-                "y": {"display": False},
-            },
+            "scales": {"x": {"display": False}, "y": {"display": False}},
             "layout": {"padding": 4},
         }
     }
 
 async def render_chart_png(config: Dict, width: int = 800, height: int = 400) -> bytes:
     payload = {"chart": config, "width": width, "height": height, "format": "png", "backgroundColor": "white"}
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=25) as client:
         r = await client.post("https://quickchart.io/chart", json=payload)
         r.raise_for_status()
         return r.content
 
 async def send_coin_chart(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
                           coin_id: str, symbol: str, color: str) -> None:
-    # 1) История за 7 дней (часовые точки)
     series = await fetch_cg_chart(coin_id, days=7, interval="hourly")
     if not series:
         await context.bot.send_message(chat_id=chat_id, text=f"{symbol}: не удалось получить данные.")
         return
-
-    # 2) PNG график
     cfg = make_chart_config(series, f"{symbol} 7d", color)
     png = await render_chart_png(cfg)
 
-    # 3) Изменения 1ч/6ч/24ч
     chg = calc_changes(series)
     now = chg.get("now")
     cap_lines = [f"{symbol}: {fmt_usd(now)}"]
@@ -368,20 +349,14 @@ async def send_coin_chart(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE
     cap_lines.append(f"24ч: {fmt_usd_delta(chg.get('d24h'))} ({fmt_pct(chg.get('p24h'))})")
     caption = "\n".join(cap_lines)
 
-    # 4) Отправка
-    await context.bot.send_photo(
-        chat_id=chat_id,
-        photo=BufferedInputFile(png, filename=f"{symbol.lower()}_7d.png"),
-        caption=caption
-    )
+    await context.bot.send_photo(chat_id=chat_id, photo=io.BytesIO(png), caption=caption)
 
 async def send_charts_pack(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE):
-    # Отправляем 2 картинки (BTC, ETH), затем маленькое сообщение с кнопками
     await send_coin_chart(chat_id, context, "bitcoin", "BTC", "#f2a900")
     await send_coin_chart(chat_id, context, "ethereum", "ETH", "#3c3c3d")
     await context.bot.send_message(chat_id=chat_id, text="Crypto charts (7d)", reply_markup=KB_CHARTS())
 
-async def handle_charts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_charts_pack(update.effective_chat.id, context)
 
 async def on_refresh_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,7 +367,7 @@ async def on_refresh_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     await send_charts_pack(update.effective_chat.id, context)
 
-# ========= /start и ChatID =========
+# ========== Start / menu / chatid ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Выберите действие:", reply_markup=KB_START)
 
@@ -440,36 +415,35 @@ async def on_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите действие:", reply_markup=KB_START)
 
-# ========= запуск (webhook) =========
+# ========== run webhook ==========
 def main():
     if not TOKEN:
-        raise SystemExit("Заполните TELEGRAM_TOKEN в .env")
+        raise SystemExit("Заполните TELEGRAM_TOKEN в .env/Environment")
     if not BASE_URL:
         raise SystemExit("Нужен BASE_URL или RENDER_EXTERNAL_URL (Render задаёт автоматически)")
 
     app = Application.builder().token(TOKEN).build()
 
-    # Команды
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("users", handle_users))
     app.add_handler(CommandHandler("crypto", handle_crypto))
-    app.add_handler(CommandHandler("charts", handle_charts_command))
+    app.add_handler(CommandHandler("charts", handle_charts))
     app.add_handler(CommandHandler("chatid", chatid))
 
-    # Кнопки
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh_users$"))
     app.add_handler(CallbackQueryHandler(on_refresh_crypto, pattern=r"^refresh_crypto$"))
+    app.add_handler(CallbackQueryHandler(on_refresh_charts, pattern=r"^refresh_charts$"))
     app.add_handler(CallbackQueryHandler(on_start_menu, pattern=r"^menu_(users|crypto|charts|chatid)$"))
     app.add_handler(CallbackQueryHandler(on_back_menu, pattern=r"^back_menu$"))
     # Поддержка старых сообщений с callback="refresh"
     app.add_handler(CallbackQueryHandler(on_refresh_users, pattern=r"^refresh$"))
-    # Обновление графиков
-    app.add_handler(CallbackQueryHandler(on_refresh_charts, pattern=r"^refresh_charts$"))
 
-    # Алиасы через текст
+    # Aliases
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!users\b", re.IGNORECASE)), handle_users))
     app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!crypto\b", re.IGNORECASE)), handle_crypto))
-    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts_command))
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^!charts\b", re.IGNORECASE)), handle_charts))
 
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     log.info("Starting webhook on port %s, path '/%s', webhook_url=%s", PORT, WEBHOOK_PATH, webhook_url)
